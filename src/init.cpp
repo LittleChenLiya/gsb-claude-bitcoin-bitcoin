@@ -1647,7 +1647,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     fDiscover = args.GetBoolArg("-discover", true);
 
     PeerManager::Options peerman_opts{};
-    ApplyArgsManOptions(args, peerman_opts);
+    if (auto result{ApplyArgsManOptions(args, peerman_opts)}; !result) {
+        return InitError(util::ErrorString(result));
+    }
 
     {
         // Read asmap file if configured or embedded asmap data and initialize

@@ -16,6 +16,7 @@
 #include <test/util/setup_common.h>
 #include <test/util/time.h>
 #include <uint256.h>
+#include <util/check.h>
 #include <validation.h>
 
 namespace {
@@ -29,7 +30,7 @@ public:
     HeadersSyncSetup(const ChainType chain_type, TestOpts opts) : TestingSetup(chain_type, opts)
     {
         PeerManager::Options peerman_opts;
-        node::ApplyArgsManOptions(*m_node.args, peerman_opts);
+        Assert(node::ApplyArgsManOptions(*m_node.args, peerman_opts));
         peerman_opts.max_headers_result = FUZZ_MAX_HEADERS_RESULTS;
         // The peerman's rng is a global that is reused, so it will be reused
         // and may cause non-determinism between runs. This may even influence
