@@ -266,6 +266,28 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason)
     // even if not directly reported below.
     uint64_t mempool_sequence = GetAndIncrementSequence();
 
+    // Update the eviction statistics. This is the single place where an
+    // entry is actually erased from the mempool, so counting here
+    // guarantees that only real removals are recorded. Confirmations
+    // (BLOCK) and reorg-related removals (REORG) are not evictions and
+    // are deliberately not counted; re-adding transactions while
+    // recovering from a reorg therefore cannot skew these counters.
+    switch (reason) {
+    case MemPoolRemovalReason::SIZELIMIT:
+        ++m_eviction_stats.capacity;
+        break;
+    case MemPoolRemovalReason::EXPIRY:
+        ++m_eviction_stats.expiry;
+        break;
+    case MemPoolRemovalReason::CONFLICT:
+    case MemPoolRemovalReason::REPLACED:
+        ++m_eviction_stats.conflict_replacement;
+        break;
+    case MemPoolRemovalReason::BLOCK:
+    case MemPoolRemovalReason::REORG:
+        break;
+    } // no default case, so the compiler warns if a new removal reason is added
+
     if (reason != MemPoolRemovalReason::BLOCK && m_opts.signals) {
         // Notify clients that a transaction has been removed from the mempool
         // for any reason except being included in a block. Clients interested

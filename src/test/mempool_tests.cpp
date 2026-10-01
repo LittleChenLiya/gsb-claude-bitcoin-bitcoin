@@ -8,6 +8,7 @@
 #include <test/util/txmempool.h>
 #include <txmempool.h>
 #include <util/time.h>
+#include <validation.h>
 
 #include <test/util/setup_common.h>
 
@@ -303,6 +304,118 @@ BOOST_AUTO_TEST_CASE(MempoolSizeLimitTest)
     clock += HALFLIFE;
     BOOST_CHECK_EQUAL(pool.GetMinFee(1).GetFeePerK(), 0);
     // ... unless it has gone all the way to 0 (after getting past DEFAULT_INCREMENTAL_RELAY_FEE/2)
+}
+
+BOOST_AUTO_TEST_CASE(MempoolEvictionStatsTest)
+{
+    auto& pool = static_cast<MemPoolTest&>(*Assert(m_node.mempool));
+    LOCK2(cs_main, pool.cs);
+    TestMemPoolEntryHelper entry;
+
+    const auto check_stats{[&](uint64_t capacity, uint64_t expiry, uint64_t conflict_replacement) {
+        const MempoolEvictionStats stats{pool.GetEvictionStats()};
+        BOOST_CHECK_EQUAL(stats.capacity, capacity);
+        BOOST_CHECK_EQUAL(stats.expiry, expiry);
+        BOOST_CHECK_EQUAL(stats.conflict_replacement, conflict_replacement);
+    }};
+
+    // Helper building a transaction with one (unique) input and one output.
+    int next_script{0};
+    const auto make_tx{[&]() {
+        CMutableTransaction tx;
+        tx.vin.resize(1);
+        tx.vin[0].scriptSig = CScript() << ++next_script;
+        tx.vout.resize(1);
+        tx.vout[0].scriptPubKey = CScript() << OP_1 << OP_EQUAL;
+        tx.vout[0].nValue = 10 * COIN;
+        return tx;
+    }};
+
+    // No evictions so far.
+    check_stats(0, 0, 0);
+
+    // Give all entries the same mocked entry time so the expiry path below
+    // can be triggered deterministically.
+    FakeNodeClock clock{1'000'000s};
+    entry.Time(NodeSeconds{1'000'000s});
+
+    // 1. Capacity eviction: trimming the (small) pool evicts the
+    //    lowest-feerate transaction.
+    const CMutableTransaction tx_keep{make_tx()};  // higher fee, survives
+    const CMutableTransaction tx_evict{make_tx()}; // lower fee, evicted
+    TryAddToMempool(pool, entry.Fee(2000LL).FromTx(tx_keep));
+    TryAddToMempool(pool, entry.Fee(500LL).FromTx(tx_evict));
+    BOOST_CHECK_EQUAL(pool.size(), 2U);
+    // Trimming to exactly the current usage removes nothing and must not count.
+    pool.TrimToSize(pool.DynamicMemoryUsage());
+    check_stats(0, 0, 0);
+    // Now shrink the pool: the low-feerate transaction is evicted for capacity.
+    pool.TrimToSize(pool.DynamicMemoryUsage() * 3 / 4);
+    BOOST_CHECK(pool.exists(tx_keep.GetHash()));
+    BOOST_CHECK(!pool.exists(tx_evict.GetHash()));
+    check_stats(1, 0, 0);
+
+    // 2. Expiry eviction: advance mock time beyond -mempoolexpiry and expire.
+    clock += pool.m_opts.expiry + 1h;
+    // Merely becoming old is not an eviction: nothing is counted until the
+    // entry is actually removed from the pool.
+    BOOST_CHECK(pool.exists(tx_keep.GetHash()));
+    check_stats(1, 0, 0);
+    const int expired{pool.Expire(GetTime<std::chrono::seconds>() - pool.m_opts.expiry)};
+    BOOST_CHECK_EQUAL(expired, 1);
+    BOOST_CHECK(!pool.exists(tx_keep.GetHash()));
+    BOOST_CHECK_EQUAL(pool.size(), 0U);
+    check_stats(1, 1, 0);
+
+    // 3a. Conflict/replacement eviction: replacement (RBF) removes the
+    //     replaced transaction via a changeset.
+    const CMutableTransaction tx_replaced{make_tx()};
+    TryAddToMempool(pool, entry.Fee(1000LL).FromTx(tx_replaced));
+    BOOST_CHECK_EQUAL(pool.size(), 1U);
+    {
+        auto changeset{pool.GetChangeSet()};
+        changeset->StageRemoval(pool.GetIter(tx_replaced.GetHash()).value());
+        changeset->Apply();
+    }
+    BOOST_CHECK(!pool.exists(tx_replaced.GetHash()));
+    check_stats(1, 1, 1);
+
+    // 3b. Conflict/replacement eviction: a connected block confirms a
+    //     transaction conflicting with a mempool transaction. A transaction
+    //     confirmed by the block itself is NOT an eviction.
+    const CMutableTransaction tx_funding{make_tx()};
+    CMutableTransaction tx_conflict_pool{make_tx()};
+    tx_conflict_pool.vin[0].prevout = COutPoint(tx_funding.GetHash(), 0);
+    CMutableTransaction tx_conflict_block{make_tx()};
+    tx_conflict_block.vin[0].prevout = COutPoint(tx_funding.GetHash(), 0);
+    const CMutableTransaction tx_mined{make_tx()};
+    TryAddToMempool(pool, entry.Fee(1000LL).FromTx(tx_conflict_pool));
+    TryAddToMempool(pool, entry.Fee(1000LL).FromTx(tx_mined));
+    BOOST_CHECK_EQUAL(pool.size(), 2U);
+    const auto removed_for_block{pool.removeForBlock({MakeTransactionRef(tx_mined), MakeTransactionRef(tx_conflict_block)})};
+    // tx_mined was removed because it was confirmed (BLOCK): not an eviction.
+    BOOST_CHECK_EQUAL(removed_for_block.size(), 1U);
+    BOOST_CHECK(!pool.exists(tx_mined.GetHash()));
+    // tx_conflict_pool was evicted as a conflict with the in-block transaction.
+    BOOST_CHECK(!pool.exists(tx_conflict_block.GetHash()));
+    BOOST_CHECK(!pool.exists(tx_conflict_pool.GetHash()));
+    BOOST_CHECK_EQUAL(pool.size(), 0U);
+    check_stats(1, 1, 2);
+
+    // 4. Reorg removals are not evictions, and re-adding transactions while
+    //    recovering from a reorg must not be miscounted as an eviction either.
+    const CMutableTransaction tx_reorg{make_tx()};
+    TryAddToMempool(pool, entry.Fee(1000LL).FromTx(tx_reorg));
+    BOOST_CHECK_EQUAL(pool.size(), 1U);
+    pool.removeForReorg(m_node.chainman->ActiveChain(), [&](CTxMemPool::txiter it) {
+        return it->GetTx().GetHash() == tx_reorg.GetHash();
+    });
+    BOOST_CHECK(!pool.exists(tx_reorg.GetHash()));
+    check_stats(1, 1, 2);
+    // Reorg recovery: the transaction is re-accepted into the pool.
+    TryAddToMempool(pool, entry.Fee(1000LL).FromTx(tx_reorg));
+    BOOST_CHECK(pool.exists(tx_reorg.GetHash()));
+    check_stats(1, 1, 2);
 }
 
 inline CTransactionRef make_tx(std::vector<CAmount>&& output_values, std::vector<CTransactionRef>&& inputs=std::vector<CTransactionRef>(), std::vector<uint32_t>&& input_indices=std::vector<uint32_t>())

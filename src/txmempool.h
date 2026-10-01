@@ -183,6 +183,30 @@ struct TxMempoolInfo
  * confirmed in a block.
  *
  */
+
+/**
+ * Read-only counters tracking how many transactions have been evicted from
+ * the mempool, broken down by eviction reason.
+ *
+ * A counter is only incremented at the moment an entry is actually erased
+ * from the mempool (CTxMemPool::removeUnchecked). Removals that are not
+ * evictions are never counted here: transactions confirmed in a block
+ * (MemPoolRemovalReason::BLOCK) and transactions dropped because of a chain
+ * reorganization (MemPoolRemovalReason::REORG) leave all counters untouched.
+ * In particular, transactions re-added to the mempool while recovering from
+ * a reorg can never be miscounted as evictions.
+ */
+struct MempoolEvictionStats
+{
+    //! Evicted because the mempool exceeded its size limit (TrimToSize).
+    uint64_t capacity{0};
+    //! Evicted because the entry exceeded the mempool expiry age (Expire).
+    uint64_t expiry{0};
+    //! Evicted due to a conflict with an in-block transaction or due to
+    //! replacement (RBF).
+    uint64_t conflict_replacement{0};
+};
+
 class CTxMemPool
 {
 protected:
@@ -200,6 +224,10 @@ protected:
     // This number is incremented once every time a transaction
     // is added or removed from the mempool for any reason.
     mutable uint64_t m_sequence_number GUARDED_BY(cs){1};
+
+    // Read-only eviction counters, see MempoolEvictionStats. Only bumped
+    // in removeUnchecked(), i.e. when an entry is actually erased.
+    MempoolEvictionStats m_eviction_stats GUARDED_BY(cs){};
 
     void trackPackageRemoved(const CFeeRate& rate) EXCLUSIVE_LOCKS_REQUIRED(cs);
 
@@ -508,6 +536,14 @@ public:
     {
         AssertLockHeld(cs);
         return m_total_fee;
+    }
+
+    /** Return a snapshot of the read-only eviction reason counters.
+     *  See MempoolEvictionStats for what is (and is not) counted. */
+    MempoolEvictionStats GetEvictionStats() const
+    {
+        LOCK(cs);
+        return m_eviction_stats;
     }
 
     bool exists(const Txid& txid) const
