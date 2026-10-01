@@ -328,7 +328,7 @@ bool CaseInsensitiveEqual(std::string_view s1, std::string_view s2);
 
 namespace util {
 /** consteval version of HexDigit() without the lookup table. */
-consteval uint8_t ConstevalHexDigit(const char c)
+constexpr uint8_t ConstevalHexDigit(const char c)
 {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 0xa;

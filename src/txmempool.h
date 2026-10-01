@@ -106,6 +106,31 @@ struct entry_time {};
 struct index_by_wtxid {};
 
 /**
+ * Snapshot of the cumulative mempool eviction counters.
+ *
+ * The counters track how many transactions have been removed from the
+ * mempool, broken down by the reason for removal. They are incremented only
+ * when a transaction is actually deleted (in removeUnchecked()), and only
+ * for the three reasons that constitute evictions:
+ *  - size_limit: evicted because the mempool exceeded its size limit
+ *    (MemPoolRemovalReason::SIZELIMIT, see TrimToSize())
+ *  - expiry: evicted because the transaction expired
+ *    (MemPoolRemovalReason::EXPIRY, see Expire())
+ *  - replaced: evicted because the transaction was replaced, e.g. by an
+ *    RBF replacement (MemPoolRemovalReason::REPLACED, see ChangeSet::Apply())
+ *
+ * Removals due to block inclusion (MemPoolRemovalReason::BLOCK), in-block
+ * conflicts (MemPoolRemovalReason::CONFLICT) or chain reorganizations
+ * (MemPoolRemovalReason::REORG) are not evictions and are never counted.
+ */
+struct EvictionStats
+{
+    uint64_t size_limit{0}; //!< Evicted due to the mempool size limit
+    uint64_t expiry{0};     //!< Evicted due to mempool expiry
+    uint64_t replaced{0};   //!< Evicted due to replacement (e.g. RBF)
+};
+
+/**
  * Information about a mempool transaction.
  */
 struct TxMempoolInfo
@@ -200,6 +225,10 @@ protected:
     // This number is incremented once every time a transaction
     // is added or removed from the mempool for any reason.
     mutable uint64_t m_sequence_number GUARDED_BY(cs){1};
+
+    // Cumulative counters of mempool evictions, broken down by eviction
+    // reason. See EvictionStats for what is and is not counted.
+    EvictionStats m_eviction_stats GUARDED_BY(cs){};
 
     void trackPackageRemoved(const CFeeRate& rate) EXCLUSIVE_LOCKS_REQUIRED(cs);
 
@@ -471,6 +500,20 @@ public:
 
     /** Expire all transaction (and their dependencies) in the mempool older than time. Return the number of removed transactions. */
     int Expire(std::chrono::seconds time) EXCLUSIVE_LOCKS_REQUIRED(cs);
+
+    /** Return a snapshot of the cumulative mempool eviction counters.
+     *
+     * The counters are incremented only when a transaction is actually
+     * removed from the mempool (in removeUnchecked()), and only for the
+     * three eviction reasons (size limiting, expiry and replacement).
+     * Removals for block inclusion, in-block conflicts or reorganizations
+     * are not counted.
+     */
+    EvictionStats GetEvictionStats() const EXCLUSIVE_LOCKS_REQUIRED(cs)
+    {
+        AssertLockHeld(cs);
+        return m_eviction_stats;
+    }
 
     /**
      * Calculate the ancestor and cluster count for the given transaction.
