@@ -190,6 +190,39 @@ static const CBlockIndex* ParseHashOrHeight(const UniValue& param, ChainstateMan
     }
 }
 
+/**
+ * Verify that the active chain tip still matches the chain-tip cursor a
+ * caller pinned when starting a sequence of block queries.
+ *
+ * When @p cursor_param is null the check is skipped (legacy behaviour: the
+ * caller did not opt into consistency). When it is provided, it must be the
+ * hex hash of the active chain tip observed before the query sequence; if the
+ * active tip has changed in the meantime (for example due to a reorg), the
+ * call fails with RPC_CHAIN_CURSOR_MISMATCH instead of returning data that
+ * could be taken from a different chain.
+ *
+ * Returns the current active chain tip, which the caller can use to continue
+ * the sequence (the tip stays stable for the rest of the call while cs_main
+ * is held).
+ */
+static const CBlockIndex* EnsureChainTipCursor(const UniValue& cursor_param, ChainstateManager& chainman)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    const CBlockIndex* current_tip{chainman.ActiveChain().Tip()};
+    if (cursor_param.isNull()) {
+        return current_tip;
+    }
+
+    const uint256 expected_tip{ParseHashV(cursor_param, "chain_tip")};
+    if (current_tip->GetBlockHash() != expected_tip) {
+        throw JSONRPCError(RPC_CHAIN_CURSOR_MISMATCH,
+                           strprintf("Chain tip cursor mismatch: expected chain tip %s, but the active chain tip is now %s (the chain was likely reorganized). Retry the query sequence with the new tip.",
+                                     expected_tip.GetHex(),
+                                     current_tip->GetBlockHash().GetHex()));
+    }
+    return current_tip;
+}
+
 UniValue blockheaderToJSON(const CBlockIndex& tip, const CBlockIndex& blockindex, const uint256 pow_limit)
 {
     // Serialize passed information without accessing chain state of the active chain!
@@ -612,22 +645,28 @@ static RPCMethod getblockhash()
         "Returns hash of block in best-block-chain at height provided.\n",
                 {
                     {"height", RPCArg::Type::NUM, RPCArg::Optional::NO, "The height index"},
+                    {"chain_tip", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "The hash of the chain tip to pin the query to. Pass the chain tip cursor returned from a previous call in the same block query sequence (or from getbestblockhash) to detect a chain reorganization between reads. If the active chain tip no longer matches this cursor, the call fails instead of returning data from a different chain. Omit to keep the legacy behaviour."},
                 },
                 RPCResult{
                     RPCResult::Type::STR_HEX, "", "The block hash"},
                 RPCExamples{
                     HelpExampleCli("getblockhash", "1000")
+            + HelpExampleCli("-named getblockhash", "height=1000 chain_tip=00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09")
             + HelpExampleRpc("getblockhash", "1000")
                 },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
 {
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     LOCK(cs_main);
-    const CChain& active_chain = chainman.ActiveChain();
+    CChain& active_chain = chainman.ActiveChain();
 
     int nHeight = request.params[0].getInt<int>();
     if (nHeight < 0 || nHeight > active_chain.Height())
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Block height out of range");
+
+    // Fail early if the caller pinned a chain-tip cursor that the active chain
+    // has already diverged from, so we never mix data from two chains.
+    EnsureChainTipCursor(request.params[1], chainman);
 
     const CBlockIndex* pblockindex = active_chain[nHeight];
     return pblockindex->GetBlockHash().GetHex();
@@ -644,6 +683,7 @@ static RPCMethod getblockheader()
                 {
                     {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The block hash"},
                     {"verbose", RPCArg::Type::BOOL, RPCArg::Default{true}, "true for a json object, false for the hex-encoded data"},
+                    {"chain_tip", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "The hash of the chain tip to pin the query to. Pass the chain-tip cursor from a previous call in the same block query sequence (or from getbestblockhash) to detect a chain reorganization between reads. If the active chain tip no longer matches this cursor, the call fails instead of returning chain-relative fields (e.g. confirmations) from a different chain. Omit to keep the legacy behaviour."},
                 },
                 {
                     RPCResult{"for verbose = true",
@@ -671,6 +711,7 @@ static RPCMethod getblockheader()
                 },
                 RPCExamples{
                     HelpExampleCli("getblockheader", "\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"")
+            + HelpExampleCli("-named getblockheader", "blockhash=00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09 chain_tip=00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09")
             + HelpExampleRpc("getblockheader", "\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\"")
                 },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
@@ -687,7 +728,8 @@ static RPCMethod getblockheader()
     {
         LOCK(cs_main);
         pblockindex = chainman.m_blockman.LookupBlockIndex(hash);
-        tip = chainman.ActiveChain().Tip();
+        // Verify the chain-tip cursor before any chain-relative data is read.
+        tip = EnsureChainTipCursor(request.params[2], chainman);
     }
 
     if (!pblockindex) {
@@ -843,6 +885,7 @@ static RPCMethod getblock()
                     {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The block hash"},
                     {"verbosity|verbose", RPCArg::Type::NUM, RPCArg::Default{1}, "0 for hex-encoded data, 1 for a JSON object, 2 for JSON object with transaction data, and 3 for JSON object with transaction data including prevout information for inputs",
                      RPCArgOptions{.skip_type_check = true}},
+                    {"chain_tip", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "The hash of the chain tip to pin the query to. Pass the chain-tip cursor from a previous call in the same block query sequence (or from getbestblockhash) to detect a chain reorganization between reads. If the active chain tip no longer matches this cursor, the call fails instead of returning chain-relative fields (e.g. confirmations) from a different chain. Omit to keep the legacy behaviour."},
                 },
                 {
                     RPCResult{"for verbosity = 0", RPCResult::Type::STR_HEX, "", "A string that is serialized, hex-encoded data for block 'hash'"},
@@ -888,7 +931,8 @@ static RPCMethod getblock()
     {
         LOCK(cs_main);
         pblockindex = chainman.m_blockman.LookupBlockIndex(hash);
-        tip = chainman.ActiveChain().Tip();
+        // Verify the chain-tip cursor before any chain-relative data is read.
+        tip = EnsureChainTipCursor(request.params[2], chainman);
 
         if (!pblockindex) {
             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");

@@ -231,6 +231,7 @@ BASE_SCRIPTS = [
     'rpc_decodescript.py',
     'rpc_blockchain.py --v1transport',
     'rpc_blockchain.py --v2transport',
+    'rpc_chain_tip_cursor.py',
     'mining_template_verification.py',
     'rpc_deprecated.py',
     'wallet_disable.py',

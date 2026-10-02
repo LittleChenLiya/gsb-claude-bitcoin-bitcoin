@@ -75,6 +75,7 @@ enum RPCErrorCode
     RPC_IN_WARMUP                   = -28, //!< Client still warming up
     RPC_METHOD_DEPRECATED           = -32, //!< RPC method is deprecated
     RPC_LIMIT_EXCEEDED              = -37, //!< A bounded resource is currently at capacity
+    RPC_CHAIN_CURSOR_MISMATCH       = -38, //!< The chain-tip cursor provided by the caller no longer matches the active chain tip (a reorg occurred)
 
     //! Aliases for backward compatibility
     RPC_TRANSACTION_ERROR           = RPC_VERIFY_ERROR,
