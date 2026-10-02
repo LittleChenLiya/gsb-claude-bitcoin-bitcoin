@@ -193,6 +193,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   dbwrapper.cpp
   deploymentstatus.cpp
   flatfile.cpp
+  handshake_failure.cpp
   headerssync.cpp
   httprpc.cpp
   httpserver.cpp

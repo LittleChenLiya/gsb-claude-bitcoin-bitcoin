@@ -20,6 +20,7 @@
 #include <crypto/siphash.h>
 #include <deploymentstatus.h>
 #include <flatfile.h>
+#include <handshake_failure.h>
 #include <headerssync.h>
 #include <index/blockfilterindex.h>
 #include <kernel/types.h>
@@ -3861,19 +3862,21 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // messages are only ever added but cannot replace existing ones.
             m_addrman.SetServices(pfrom.addr, nServices);
         }
-        if (pfrom.ExpectServicesFromConn() && !HasAllDesirableServiceFlags(nServices))
-        {
-            LogDebug(BCLog::NET, "peer does not offer the expected services (%08x offered, %08x expected), %s",
-                     nServices,
-                     GetDesirableServiceFlags(nServices),
-                     pfrom.DisconnectMsg());
-            pfrom.fDisconnect = true;
-            return;
-        }
-
-        if (nVersion < MIN_PEER_PROTO_VERSION) {
-            // disconnect from peers older than this proto version
-            LogDebug(BCLog::NET, "peer using obsolete version %i, %s", nVersion, pfrom.DisconnectMsg());
+        // Classify and record the handshake failure phase (service bits are
+        // checked before the protocol version, as before). A VERSION message
+        // that passes both checks records nothing.
+        if (const auto failure_phase = NoteVersionHandshakeFailure(
+                pfrom.ExpectServicesFromConn(), nServices, GetDesirableServiceFlags(nServices),
+                nVersion, MIN_PEER_PROTO_VERSION, pfrom.GetId())) {
+            if (*failure_phase == HandshakeFailurePhase::kServiceFlags) {
+                LogDebug(BCLog::NET, "peer does not offer the expected services (%08x offered, %08x expected), %s",
+                         nServices,
+                         GetDesirableServiceFlags(nServices),
+                         pfrom.DisconnectMsg());
+            } else {
+                // disconnect from peers older than this proto version
+                LogDebug(BCLog::NET, "peer using obsolete version %i, %s", nVersion, pfrom.DisconnectMsg());
+            }
             pfrom.fDisconnect = true;
             return;
         }

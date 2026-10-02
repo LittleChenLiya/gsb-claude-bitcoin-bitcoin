@@ -16,6 +16,7 @@
 #include <compat/compat.h>
 #include <consensus/consensus.h>
 #include <crypto/sha256.h>
+#include <handshake_failure.h>
 #include <i2p.h>
 #include <key.h>
 #include <logging.h>
@@ -2087,6 +2088,10 @@ bool CConnman::InactivityCheck(const CNode& node, NodeClock::time_point now) con
         } else {
             LogDebug(BCLog::NET, "version handshake timeout, %s", node.DisconnectMsg());
         }
+        // Record the handshake failure phase. This path is only reachable
+        // before the handshake completed, so successful handshakes never
+        // produce a record.
+        NoteHandshakeTimeout(node.GetId());
         return true;
     }
 
