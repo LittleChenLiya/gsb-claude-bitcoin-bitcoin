@@ -94,6 +94,11 @@ struct ConnmanTestMsg : public CConnman {
         SocketHandler();
     }
 
+    bool InactivityCheckPublic(const CNode& node, NodeClock::time_point now) const
+    {
+        return InactivityCheck(node, now);
+    }
+
     void Handshake(CNode& node,
                    bool successfully_connected,
                    ServiceFlags remote_services,

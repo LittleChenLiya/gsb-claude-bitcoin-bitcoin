@@ -79,6 +79,7 @@ add_executable(test_bitcoin
   orphanage_tests.cpp
   pcp_tests.cpp
   peerman_tests.cpp
+  handshake_tests.cpp
   pmt_tests.cpp
   pool_tests.cpp
   pow_tests.cpp

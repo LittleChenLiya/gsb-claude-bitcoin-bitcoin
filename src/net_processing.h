@@ -207,6 +207,16 @@ public:
      * we do not have a confirmed set of service flags.
     */
     virtual ServiceFlags GetDesirableServiceFlags(ServiceFlags services) const = 0;
+
+    /**
+     * Returns the stage at which the peer's version handshake failed, or
+     * std::nullopt if the handshake succeeded or has not failed.
+     *
+     * Public for unit testing. The record contains only the peer's local id
+     * and the failure stage -- never the peer's address or authentication
+     * material.
+     */
+    virtual std::optional<HandshakeFailureStage> GetHandshakeFailureStage(NodeId nodeid) const = 0;
 };
 
 #endif // BITCOIN_NET_PROCESSING_H

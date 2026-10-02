@@ -2052,6 +2052,15 @@ bool CConnman::InactivityCheck(const CNode& node, NodeClock::time_point now) con
     bool has_received{last_recv > NodeClock::epoch};
     bool has_sent{last_send > NodeClock::epoch};
 
+    // Record a handshake failure if the peer is disconnected before the version
+    // handshake completed. The record must not include the peer's address or
+    // authentication material.
+    const auto record_handshake_failure = [&]() {
+        if (!node.fSuccessfullyConnected && m_msgproc) {
+            m_msgproc->HandshakeFailure(node, HandshakeFailureStage::TIMEOUT);
+        }
+    };
+
     if (!has_received || !has_sent) {
         std::string has_never;
         if (!has_received) has_never += ", never received from peer";
@@ -2062,6 +2071,7 @@ bool CConnman::InactivityCheck(const CNode& node, NodeClock::time_point now) con
             has_never,
             node.DisconnectMsg()
         );
+        record_handshake_failure();
         return true;
     }
 
@@ -2070,6 +2080,7 @@ bool CConnman::InactivityCheck(const CNode& node, NodeClock::time_point now) con
             "socket sending timeout: %is, %s", Ticks<std::chrono::seconds>(now - last_send),
             node.DisconnectMsg()
         );
+        record_handshake_failure();
         return true;
     }
 
@@ -2078,6 +2089,7 @@ bool CConnman::InactivityCheck(const CNode& node, NodeClock::time_point now) con
             "socket receive timeout: %is, %s", Ticks<std::chrono::seconds>(now - last_recv),
             node.DisconnectMsg()
         );
+        record_handshake_failure();
         return true;
     }
 
@@ -2087,6 +2099,7 @@ bool CConnman::InactivityCheck(const CNode& node, NodeClock::time_point now) con
         } else {
             LogDebug(BCLog::NET, "version handshake timeout, %s", node.DisconnectMsg());
         }
+        record_handshake_failure();
         return true;
     }
 

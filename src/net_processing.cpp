@@ -208,6 +208,18 @@ static constexpr auto PRIVATE_BROADCAST_MAX_CONNECTION_LIFETIME{3min};
 
 // Internal stuff
 namespace {
+
+/** Returns a short, stable name for a handshake failure stage, used in logs. */
+std::string HandshakeFailureStageName(HandshakeFailureStage stage)
+{
+    switch (stage) {
+    case HandshakeFailureStage::VERSION_NEGOTIATION: return "version-negotiation";
+    case HandshakeFailureStage::SERVICE_BITS: return "service-bits";
+    case HandshakeFailureStage::TIMEOUT: return "timeout";
+    } // no default case, so the compiler can warn about missing cases
+    return "unknown";
+}
+
 /** Blocks that are in flight, and that are in the queue to be downloaded. */
 struct QueuedBlock {
     /** BlockIndex. We must have this since we only request blocks when we've already validated the header. */
@@ -590,6 +602,7 @@ public:
     /** Implement NetEventsInterface */
     void InitializeNode(const CNode& node, ServiceFlags our_services) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_tx_download_mutex);
     void FinalizeNode(const CNode& node) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, !m_tx_download_mutex);
+    void HandshakeFailure(const CNode& node, HandshakeFailureStage stage) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     bool HasAllDesirableServiceFlags(ServiceFlags services) const override;
     bool ProcessMessages(CNode& node, std::atomic<bool>& interrupt) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
@@ -617,6 +630,7 @@ public:
     void UnitTestMisbehaving(NodeId peer_id) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex) { Misbehaving(*Assert(GetPeerRef(peer_id)), ""); };
     void UpdateLastBlockAnnounceTime(NodeId node, NodeClock::time_point time) override;
     ServiceFlags GetDesirableServiceFlags(ServiceFlags services) const override;
+    std::optional<HandshakeFailureStage> GetHandshakeFailureStage(NodeId nodeid) const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
 
 private:
     void ProcessMessage(Peer& peer, CNode& pfrom, const std::string& msg_type, DataStream& vRecv, NodeClock::time_point time_received,
@@ -900,6 +914,17 @@ private:
      * their own locks.
      */
     std::map<NodeId, PeerRef> m_peer_map GUARDED_BY(m_peer_mutex);
+
+    /**
+     * Stages at which peers failed the version handshake, keyed by peer id.
+     *
+     * Entries are recorded when a peer is disconnected before the version
+     * handshake completes, and removed when the peer is finalized. Successful
+     * handshakes never produce an entry. The record contains only the peer's
+     * local id and the failure stage -- never the peer's address or any
+     * authentication material.
+     */
+    std::map<NodeId, HandshakeFailureStage> m_handshake_failures GUARDED_BY(m_peer_mutex);
 
     /** Map maintaining per-node state. */
     std::map<NodeId, CNodeState> m_node_states GUARDED_BY(cs_main);
@@ -1823,6 +1848,11 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
 
     m_node_states.erase(nodeid);
 
+    {
+        LOCK(m_peer_mutex);
+        m_handshake_failures.erase(nodeid);
+    }
+
     if (m_node_states.empty()) {
         // Do a consistency check after the last peer is removed.
         assert(mapBlocksInFlight.empty());
@@ -1854,6 +1884,18 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
     LogDebug(BCLog::NET, "Cleared nodestate for peer=%d\n", nodeid);
 }
 
+void PeerManagerImpl::HandshakeFailure(const CNode& node, HandshakeFailureStage stage)
+{
+    const NodeId nodeid{node.GetId()};
+    LOCK(m_peer_mutex);
+    // Record the failure stage for this peer. Successful handshakes never call
+    // this method, so they never produce an entry. The record contains only
+    // the peer's local id and the failure stage -- never the peer's address or
+    // any authentication material.
+    m_handshake_failures[nodeid] = stage;
+    LogInfo("handshake failure: stage=%s, peer=%d\n", HandshakeFailureStageName(stage), nodeid);
+}
+
 bool PeerManagerImpl::HasAllDesirableServiceFlags(ServiceFlags services) const
 {
     // Shortcut for (services & GetDesirableServiceFlags(services)) == GetDesirableServiceFlags(services)
@@ -1869,6 +1911,14 @@ ServiceFlags PeerManagerImpl::GetDesirableServiceFlags(ServiceFlags services) co
         }
     }
     return ServiceFlags(NODE_NETWORK | NODE_WITNESS);
+}
+
+std::optional<HandshakeFailureStage> PeerManagerImpl::GetHandshakeFailureStage(NodeId nodeid) const
+{
+    LOCK(m_peer_mutex);
+    auto it = m_handshake_failures.find(nodeid);
+    if (it == m_handshake_failures.end()) return std::nullopt;
+    return it->second;
 }
 
 PeerRef PeerManagerImpl::GetPeerRef(NodeId id) const
@@ -3867,6 +3917,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                      nServices,
                      GetDesirableServiceFlags(nServices),
                      pfrom.DisconnectMsg());
+            HandshakeFailure(pfrom, HandshakeFailureStage::SERVICE_BITS);
             pfrom.fDisconnect = true;
             return;
         }
@@ -3874,6 +3925,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         if (nVersion < MIN_PEER_PROTO_VERSION) {
             // disconnect from peers older than this proto version
             LogDebug(BCLog::NET, "peer using obsolete version %i, %s", nVersion, pfrom.DisconnectMsg());
+            HandshakeFailure(pfrom, HandshakeFailureStage::VERSION_NEGOTIATION);
             pfrom.fDisconnect = true;
             return;
         }

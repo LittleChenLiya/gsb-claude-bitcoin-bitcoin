@@ -1035,6 +1035,19 @@ private:
 };
 
 /**
+ * Stage at which a peer's version handshake can fail.
+ *
+ * This is used to record why a peer was disconnected before the version
+ * handshake completed. The record must not include identifying information
+ * such as the peer's address or authentication material.
+ */
+enum class HandshakeFailureStage {
+    VERSION_NEGOTIATION, ///< Peer's protocol version is too old or incompatible
+    SERVICE_BITS,        ///< Peer does not offer the service bits we require
+    TIMEOUT,             ///< Peer did not complete the handshake in time
+};
+
+/**
  * Interface for message handling
  */
 class NetEventsInterface
@@ -1048,6 +1061,15 @@ public:
 
     /** Handle removal of a peer (clear state) */
     virtual void FinalizeNode(const CNode& node) = 0;
+
+    /**
+     * Record that a peer's version handshake failed at the given stage.
+     *
+     * This is called when a peer is disconnected before the version handshake
+     * completes. Implementations must not include identifying information such
+     * as the peer's address or authentication material in the record.
+     */
+    virtual void HandshakeFailure(const CNode& node, HandshakeFailureStage stage) = 0;
 
     /**
      * Callback to determine whether the given set of service flags are sufficient
