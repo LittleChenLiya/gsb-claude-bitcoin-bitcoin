@@ -4,10 +4,13 @@
 
 #include <chain.h>
 #include <chainparams.h>
+#include <common/args.h>
 #include <consensus/params.h>
+#include <net.h>
 #include <net_processing.h>
 #include <node/block_template_manager.h>
 #include <node/miner.h>
+#include <node/peerman_args.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <protocol.h>
@@ -15,6 +18,7 @@
 #include <test/util/setup_common.h>
 #include <test/util/time.h>
 #include <util/check.h>
+#include <util/result.h>
 #include <validation.h>
 #include <validationinterface.h>
 
@@ -22,6 +26,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 BOOST_FIXTURE_TEST_SUITE(peerman_tests, RegTestingSetup)
 
@@ -87,6 +93,166 @@ BOOST_AUTO_TEST_CASE(connections_desirable_service_flags)
     // Lastly, verify the stale tip checks can disallow limited peers connections after not receiving blocks for a prolonged period.
     clock += std::chrono::seconds{consensus.nPowTargetSpacing * NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS + 1};
     BOOST_CHECK(peerman->GetDesirableServiceFlags(peer_flags) == ServiceFlags(NODE_NETWORK | NODE_WITNESS));
+}
+
+namespace {
+//! Register the arguments read by node::ApplyArgsManOptions so that a plain
+//! (non-fixture) ArgsManager accepts them.
+void RegisterPeerArgs(ArgsManager& argsman)
+{
+    argsman.AddArg("-blocksonly", "", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-blockreconstructionextratxn=<n>", "", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-capturemessages", "", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-connect=<ip>", "", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-maxconnections=<n>", "", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-privatebroadcast", "", ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-txreconciliation", "", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-txsendrate=<n>", "", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
+}
+
+//! Parse a command line like "-privatebroadcast -connect=1.2.3.4" for @p argsman.
+void ParsePeerArgs(ArgsManager& argsman, const std::string& command_line)
+{
+    std::vector<std::string> tokens{"bitcoind"};
+    if (!command_line.empty()) {
+        std::string current;
+        for (char c : command_line) {
+            if (c == ' ') {
+                tokens.push_back(current);
+                current.clear();
+            } else {
+                current += c;
+            }
+        }
+        tokens.push_back(current);
+    }
+    std::vector<const char*> argv;
+    argv.reserve(tokens.size());
+    for (const std::string& token : tokens) argv.push_back(token.c_str());
+    std::string error;
+    BOOST_REQUIRE(argsman.ParseParameters(argv.size(), argv.data(), error));
+    BOOST_CHECK(error.empty());
+}
+
+//! Apply the given command line to a fresh PeerManager::Options and return the result.
+util::Result<void> ApplyPeerArgs(const std::string& command_line, PeerManager::Options& opts)
+{
+    ArgsManager argsman;
+    RegisterPeerArgs(argsman);
+    ParsePeerArgs(argsman, command_line);
+    return node::ApplyArgsManOptions(argsman, opts);
+}
+
+//! Convenience wrapper when the resulting options are not inspected.
+util::Result<void> CheckPeerArgs(const std::string& command_line)
+{
+    PeerManager::Options opts;
+    return ApplyPeerArgs(command_line, opts);
+}
+} // namespace
+
+// Verify mutually exclusive connection-limit combinations are rejected and
+// that the error message names the specific option instead of producing a
+// generic argument parsing failure.
+BOOST_AUTO_TEST_CASE(peer_args_conflicts)
+{
+    // -privatebroadcast together with -connect=<ip> is incompatible.
+    {
+        auto result{CheckPeerArgs("-privatebroadcast=1 -connect=127.0.0.1:8333")};
+        BOOST_REQUIRE(!result);
+        const std::string message{util::ErrorString(result).original};
+        BOOST_CHECK(message.find("-privatebroadcast") != std::string::npos);
+        BOOST_CHECK(message.find("-connect") != std::string::npos);
+    }
+
+    // -privatebroadcast together with the negated form -noconnect is
+    // incompatible as well, even with no -connect value given.
+    {
+        auto result{CheckPeerArgs("-privatebroadcast -noconnect")};
+        BOOST_REQUIRE(!result);
+        const std::string message{util::ErrorString(result).original};
+        BOOST_CHECK(message.find("-privatebroadcast") != std::string::npos);
+        BOOST_CHECK(message.find("-connect") != std::string::npos);
+    }
+
+    // A negative -maxconnections is invalid and the message must point at
+    // that specific option.
+    {
+        auto result{CheckPeerArgs("-maxconnections=-1")};
+        BOOST_REQUIRE(!result);
+        const std::string message{util::ErrorString(result).original};
+        BOOST_CHECK_EQUAL(message, "-maxconnections must be greater or equal than zero");
+    }
+}
+
+// Boundary values: the smallest allowed -maxconnections (0) must be accepted,
+// including in combination with -privatebroadcast, and the options must be
+// applied as requested.
+BOOST_AUTO_TEST_CASE(peer_args_boundaries)
+{
+    // -maxconnections=0 alone is valid (disables automatic connections).
+    BOOST_CHECK(CheckPeerArgs("-maxconnections=0"));
+
+    // -maxconnections=0 is an explicitly supported setup together with
+    // -privatebroadcast: private broadcast connections have their own limit.
+    {
+        PeerManager::Options opts;
+        auto result{ApplyPeerArgs("-maxconnections=0 -privatebroadcast=1", opts)};
+        BOOST_REQUIRE(result);
+        BOOST_CHECK(opts.private_broadcast);
+    }
+
+    // -connect alone (without -privatebroadcast) remains valid.
+    BOOST_CHECK(CheckPeerArgs("-connect=127.0.0.1:8333"));
+
+    // -privatebroadcast can be explicitly disabled together with -connect.
+    {
+        PeerManager::Options opts;
+        auto result{ApplyPeerArgs("-privatebroadcast=0 -connect=127.0.0.1:8333", opts)};
+        BOOST_REQUIRE(result);
+        BOOST_CHECK(!opts.private_broadcast);
+    }
+}
+
+// When no relevant argument is provided, every built-in default must remain
+// unchanged and no error must be reported.
+BOOST_AUTO_TEST_CASE(peer_args_defaults)
+{
+    {
+        PeerManager::Options applied;
+        const PeerManager::Options defaults;
+        auto result{ApplyPeerArgs("", applied)};
+        BOOST_REQUIRE(result);
+        BOOST_CHECK_EQUAL(applied.ignore_incoming_txs, defaults.ignore_incoming_txs);
+        BOOST_CHECK_EQUAL(applied.reconcile_txs, defaults.reconcile_txs);
+        BOOST_CHECK_EQUAL(applied.max_extra_txs, defaults.max_extra_txs);
+        BOOST_CHECK_EQUAL(applied.capture_messages, defaults.capture_messages);
+        BOOST_CHECK_EQUAL(applied.private_broadcast, defaults.private_broadcast);
+        BOOST_CHECK_EQUAL(applied.tx_send_rate, defaults.tx_send_rate);
+    }
+
+    // Unrelated peer options without conflicts keep working.
+    {
+        PeerManager::Options opts;
+        auto result{ApplyPeerArgs("-txreconciliation=1 -blocksonly=1 -txsendrate=7 -blockreconstructionextratxn=42", opts)};
+        BOOST_REQUIRE(result);
+        BOOST_CHECK(opts.reconcile_txs);
+        BOOST_CHECK(opts.ignore_incoming_txs);
+        BOOST_CHECK_EQUAL(opts.tx_send_rate, 7u);
+        BOOST_CHECK_EQUAL(opts.max_extra_txs, 42u);
+    }
+
+    // Default private broadcast is off, so it does not conflict with the
+    // default -connect-less setup or with an explicit -connect when the
+    // default is kept.
+    {
+        PeerManager::Options opts;
+        // Note: -connect provided but -privatebroadcast left at its default
+        BOOST_REQUIRE(ApplyPeerArgs("-connect=127.0.0.1:8333 -txsendrate=0", opts));
+        BOOST_CHECK(!opts.private_broadcast);
+        // txsendrate is clamped to the documented minimum of 1.
+        BOOST_CHECK_EQUAL(opts.tx_send_rate, 1u);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

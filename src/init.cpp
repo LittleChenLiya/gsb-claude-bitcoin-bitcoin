@@ -567,7 +567,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-bantime=<n>", strprintf("Default duration (in seconds) of manually configured bans (default: %u)", DEFAULT_MISBEHAVING_BANTIME), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-bind=<addr>[:<port>][=onion]", strprintf("Bind to given address and always listen on it (default: 0.0.0.0). Use [host]:port notation for IPv6. Append =onion to tag any incoming connections to that address and port as incoming Tor connections (default: 127.0.0.1:%u=onion, testnet3: 127.0.0.1:%u=onion, testnet4: 127.0.0.1:%u=onion, signet: 127.0.0.1:%u=onion, regtest: 127.0.0.1:%u=onion)", defaultChainParams->GetDefaultPort() + 1, testnetChainParams->GetDefaultPort() + 1, testnet4ChainParams->GetDefaultPort() + 1, signetChainParams->GetDefaultPort() + 1, regtestChainParams->GetDefaultPort() + 1), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-cjdnsreachable", "If set, then this host is configured for CJDNS (connecting to fc00::/8 addresses would lead us to the CJDNS network, see doc/cjdns.md) (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-connect=<ip>", "Connect only to the specified node; -noconnect disables automatic connections (the rules for this peer are the same as for -addnode). This option can be specified multiple times to connect to multiple nodes.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-connect=<ip>", "Connect only to the specified node; -noconnect disables automatic connections (the rules for this peer are the same as for -addnode). This option can be specified multiple times to connect to multiple nodes. Cannot be combined with -privatebroadcast, which needs to open its own outgoing connections; use -maxconnections=0 together with -addnode instead in that case.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-discover", "Discover own IP addresses (default: 1 when listening and no -externalip or -proxy)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-dns", strprintf("Allow DNS lookups for -addnode, -seednode and -connect (default: %u)", DEFAULT_NAME_LOOKUP), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-dnsseed", strprintf("Query for peer addresses via DNS lookup, if low on addresses (default: %u unless -connect used or -maxconnections=0)", DEFAULT_DNSSEED), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -576,9 +576,10 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-forcednsseed", strprintf("Always query for peer addresses via DNS lookup (default: %u)", DEFAULT_FORCEDNSSEED), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-listen", strprintf("Accept connections from outside (default: %u if no -proxy, -connect or -maxconnections=0)", DEFAULT_LISTEN), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-listenonion", strprintf("Automatically create Tor onion service (default: %d)", DEFAULT_LISTEN_ONION), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-maxconnections=<n>", strprintf("Maintain at most <n> automatic connections to peers (default: %u). %u slots of these are reserved for outgoing connections. See -inboundrelaypercent for more information about limits applied to transaction relay inbound peers. "
+    argsman.AddArg("-maxconnections=<n>", strprintf("Maintain at most <n> automatic connections to peers (default: %u; minimum: 0, which disables automatic connections). %u slots of these are reserved for outgoing connections. See -inboundrelaypercent for more information about limits applied to transaction relay inbound peers. "
                                                     "This limit does not apply to connections manually added via -addnode or the addnode RPC, which have a separate limit of %u. "
-                                                    "It does not apply to short-lived private broadcast connections either, which have a separate limit of %u.",
+                                                    "It does not apply to short-lived private broadcast connections either, which have a separate limit of %u. "
+                                                    "A value of 0 is compatible with -privatebroadcast, unlike -connect/-noconnect.",
                                                     DEFAULT_MAX_PEER_CONNECTIONS, MAX_OUTBOUND_FULL_RELAY_CONNECTIONS + MAX_BLOCK_RELAY_ONLY_CONNECTIONS + MAX_FEELER_CONNECTIONS, MAX_ADDNODE_CONNECTIONS, MAX_PRIVATE_BROADCAST_CONNECTIONS),
                    ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-inboundrelaypercent=<n>", strprintf("Permit a maximum percent of inbound connections to relay transactions, to limit memory utilization (0 to 100, default: %u).", DEFAULT_FULL_RELAY_INBOUND_PCT), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -718,8 +719,10 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                        "EXPERIMENTAL: Broadcast transactions submitted via sendrawtransaction RPC using short-lived "
                        "connections through the Tor or I2P networks, without putting them in the mempool first. "
                        "This provides best-effort concealment of the transaction's origin. "
-                       "Transactions submitted through the wallet are not affected by this option "
-                       "(default: %u)",
+                       "Transactions submitted through the wallet are not affected by this option. "
+                       "Incompatible with -connect/-noconnect, because automatic outgoing connections must remain "
+                       "available to reach random Tor or I2P peers; -maxconnections=0 together with -addnode can be "
+                       "used instead (default: %u)",
                    DEFAULT_PRIVATE_BROADCAST),
                    ArgsManager::ALLOW_ANY,
                    OptionsCategory::NODE_RELAY);
@@ -1217,6 +1220,13 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         if (!mempool_result) {
             return InitError(util::ErrorString(mempool_result));
         }
+        // Validate peer-manager related connection-limit options, in
+        // particular that no mutually exclusive combination was provided.
+        PeerManager::Options peerman_opts_dummy{};
+        auto peerman_result{ApplyArgsManOptions(args, peerman_opts_dummy)};
+        if (!peerman_result) {
+            return InitError(util::ErrorString(peerman_result));
+        }
     }
 
     return true;
@@ -1647,7 +1657,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     fDiscover = args.GetBoolArg("-discover", true);
 
     PeerManager::Options peerman_opts{};
-    ApplyArgsManOptions(args, peerman_opts);
+    Assert(ApplyArgsManOptions(args, peerman_opts)); // no error can happen, already checked in AppInitParameterInteraction
 
     {
         // Read asmap file if configured or embedded asmap data and initialize
@@ -2369,13 +2379,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             return InitError(_("Private broadcast of own transactions requested (-privatebroadcast), "
                                "but none of Tor or I2P networks is reachable"));
         }
-        if (!connOptions.m_use_addrman_outgoing) {
-            return InitError(_("Private broadcast of own transactions requested (-privatebroadcast), "
-                               "but -connect is also configured. They are incompatible because the "
-                               "private broadcast needs to open new connections to randomly "
-                               "chosen Tor or I2P peers. Consider using -maxconnections=0 -addnode=... "
-                               "instead"));
-        }
+        // Note: the conflict between -privatebroadcast and -connect/-noconnect
+        // is reported earlier, in ApplyArgsManOptions() during
+        // AppInitParameterInteraction().
         if (!proxyRandomize && (g_reachable_nets.Contains(NET_ONION) || onion_may_become_reachable)) {
             InitWarning(_("Private broadcast of own transactions requested (-privatebroadcast) and "
                           "-proxyrandomize is disabled. Tor circuits for private broadcast connections "
