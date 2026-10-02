@@ -635,15 +635,40 @@ static RPCMethod getblockhash()
     };
 }
 
+//! Verify that a chain cursor still identifies a block in the active chain.
+//! A cursor is valid as long as the block it identifies is part of the active
+//! chain. Appending new blocks keeps the cursor valid; a reorganization that
+//! replaces the cursor block (or anything above it) invalidates it, allowing
+//! callers to detect that two reads may observe different chains.
+//! Throws RPC_CHAIN_CURSOR_MISMATCH if the cursor is unknown or no longer on
+//! the active chain.
+static void CheckChainCursor(const ChainstateManager& chainman, const uint256& chain_cursor)
+{
+    AssertLockHeld(::cs_main);
+    const CBlockIndex* pcursor{chainman.m_blockman.LookupBlockIndex(chain_cursor)};
+    if (!pcursor || !chainman.ActiveChain().Contains(*pcursor)) {
+        throw JSONRPCError(RPC_CHAIN_CURSOR_MISMATCH,
+            strprintf("Chain cursor %s is no longer part of the active chain; the chain has been reorganized since the cursor was obtained", chain_cursor.GetHex()));
+    }
+}
+
+//! The chain cursor returned alongside block queries when a cursor was provided.
+static UniValue ChainCursorJSON(const CBlockIndex& tip)
+{
+    return tip.GetBlockHash().GetHex();
+}
+
 static RPCMethod getblockheader()
 {
     return RPCMethod{
         "getblockheader",
         "If verbose is false, returns a string that is serialized, hex-encoded data for blockheader 'hash'.\n"
-                "If verbose is true, returns an Object with information about blockheader <hash>.\n",
+                "If verbose is true, returns an Object with information about blockheader <hash>.\n"
+                "If 'chain_cursor' is provided, it must identify a block that is still part of the active chain (see getchaintipcursor). If the chain has been reorganized since the cursor was obtained, the call fails with a chain-cursor-mismatch error rather than returning data from a different chain. When verbose is true, the current chain cursor is returned in the 'chain_cursor' field.\n",
                 {
                     {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The block hash"},
                     {"verbose", RPCArg::Type::BOOL, RPCArg::Default{true}, "true for a json object, false for the hex-encoded data"},
+                    {"chain_cursor", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "An active-chain cursor previously obtained from getchaintipcursor (or a previous block query). When present, the node verifies that the cursor still identifies a block in the active chain and fails with a chain-cursor-mismatch error if the chain has been reorganized."},
                 },
                 {
                     RPCResult{"for verbose = true",
@@ -665,6 +690,7 @@ static RPCMethod getblockheader()
                             {RPCResult::Type::NUM, "nTx", "The number of transactions in the block"},
                             {RPCResult::Type::STR_HEX, "previousblockhash", /*optional=*/true, "The hash of the previous block (if available)"},
                             {RPCResult::Type::STR_HEX, "nextblockhash", /*optional=*/true, "The hash of the next block (if available)"},
+                            {RPCResult::Type::STR_HEX, "chain_cursor", /*optional=*/true, "The current active chain tip cursor (see getchaintipcursor). Only present when a 'chain_cursor' parameter was provided; it can be passed to subsequent block queries to detect chain reorganizations between reads."},
                         }},
                     RPCResult{"for verbose=false",
                         RPCResult::Type::STR_HEX, "", "A string that is serialized, hex-encoded data for block 'hash'"},
@@ -681,6 +707,11 @@ static RPCMethod getblockheader()
     if (!request.params[1].isNull())
         fVerbose = request.params[1].get_bool();
 
+    std::optional<uint256> chain_cursor;
+    if (!request.params[2].isNull()) {
+        chain_cursor = ParseHashV(request.params[2], "chain_cursor");
+    }
+
     const CBlockIndex* pblockindex;
     const CBlockIndex* tip;
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
@@ -688,6 +719,10 @@ static RPCMethod getblockheader()
         LOCK(cs_main);
         pblockindex = chainman.m_blockman.LookupBlockIndex(hash);
         tip = chainman.ActiveChain().Tip();
+
+        if (chain_cursor) {
+            CheckChainCursor(chainman, *chain_cursor);
+        }
     }
 
     if (!pblockindex) {
@@ -702,7 +737,11 @@ static RPCMethod getblockheader()
         return strHex;
     }
 
-    return blockheaderToJSON(*tip, *pblockindex, chainman.GetConsensus().powLimit);
+    UniValue ret{blockheaderToJSON(*tip, *pblockindex, chainman.GetConsensus().powLimit)};
+    if (chain_cursor) {
+        ret.pushKV("chain_cursor", ChainCursorJSON(*tip));
+    }
+    return ret;
 },
     };
 }
@@ -805,6 +844,7 @@ static std::vector<RPCResult> GetBlockFields(RPCResult tx_result, std::optional<
     fields.emplace_back(RPCResult::Type::NUM, "nTx", "The number of transactions in the block");
     fields.emplace_back(RPCResult::Type::STR_HEX, "previousblockhash", /*optional=*/true, "The hash of the previous block (if available)");
     fields.emplace_back(RPCResult::Type::STR_HEX, "nextblockhash", /*optional=*/true, "The hash of the next block (if available)");
+    fields.emplace_back(RPCResult::Type::STR_HEX, "chain_cursor", /*optional=*/true, "The current active chain tip cursor (see getchaintipcursor). Only present when a 'chain_cursor' parameter was provided; it can be passed to subsequent block queries to detect chain reorganizations between reads.");
     if (elision_msg) {
         // Elide all block-level fields except the tx array (which differs per verbosity)
         std::vector<RPCResult> new_fields;
@@ -838,11 +878,13 @@ static RPCMethod getblock()
         "If verbosity is 0, returns a string that is serialized, hex-encoded data for block 'hash'.\n"
                 "If verbosity is 1, returns an Object with information about block <hash>.\n"
                 "If verbosity is 2, returns an Object with information about block <hash> and information about each transaction.\n"
-                "If verbosity is 3, returns an Object with information about block <hash> and information about each transaction, including prevout information for inputs (only for unpruned blocks in the current best chain).\n",
+                "If verbosity is 3, returns an Object with information about block <hash> and information about each transaction, including prevout information for inputs (only for unpruned blocks in the current best chain).\n"
+                "If 'chain_cursor' is provided, it must identify a block that is still part of the active chain (see getchaintipcursor). If the chain has been reorganized since the cursor was obtained, the call fails with a chain-cursor-mismatch error rather than returning data from a different chain. For verbosity 1-3, the current chain cursor is returned in the 'chain_cursor' field; for verbosity 0 the cursor is still verified but no new cursor can be returned alongside the hex data.\n",
                 {
                     {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The block hash"},
                     {"verbosity|verbose", RPCArg::Type::NUM, RPCArg::Default{1}, "0 for hex-encoded data, 1 for a JSON object, 2 for JSON object with transaction data, and 3 for JSON object with transaction data including prevout information for inputs",
                      RPCArgOptions{.skip_type_check = true}},
+                    {"chain_cursor", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "An active-chain cursor previously obtained from getchaintipcursor (or a previous block query). When present, the node verifies that the cursor still identifies a block in the active chain and fails with a chain-cursor-mismatch error if the chain has been reorganized."},
                 },
                 {
                     RPCResult{"for verbosity = 0", RPCResult::Type::STR_HEX, "", "A string that is serialized, hex-encoded data for block 'hash'"},
@@ -882,6 +924,11 @@ static RPCMethod getblock()
 
     int verbosity{ParseVerbosity(request.params[1], /*default_verbosity=*/1, /*allow_bool=*/true)};
 
+    std::optional<uint256> chain_cursor;
+    if (!request.params[2].isNull()) {
+        chain_cursor = ParseHashV(request.params[2], "chain_cursor");
+    }
+
     const CBlockIndex* pblockindex;
     const CBlockIndex* tip;
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
@@ -892,6 +939,10 @@ static RPCMethod getblock()
 
         if (!pblockindex) {
             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
+        }
+
+        if (chain_cursor) {
+            CheckChainCursor(chainman, *chain_cursor);
         }
     }
 
@@ -913,7 +964,11 @@ static RPCMethod getblock()
         tx_verbosity = TxVerbosity::SHOW_DETAILS_AND_PREVOUT;
     }
 
-    return blockToJSON(chainman.m_blockman, block, *tip, *pblockindex, tx_verbosity, chainman.GetConsensus().powLimit);
+    UniValue ret{blockToJSON(chainman.m_blockman, block, *tip, *pblockindex, tx_verbosity, chainman.GetConsensus().powLimit)};
+    if (chain_cursor) {
+        ret.pushKV("chain_cursor", ChainCursorJSON(*tip));
+    }
+    return ret;
 },
     };
 }
@@ -1591,6 +1646,45 @@ RPCMethod getdeploymentinfo()
             deploymentinfo.pushKV("deployments", DeploymentInfo(blockindex, chainman));
             return deploymentinfo;
         },
+    };
+}
+
+static RPCMethod getchaintipcursor()
+{
+    return RPCMethod{
+        "getchaintipcursor",
+        "Returns a cursor identifying the current active chain tip. The cursor can be passed to\n"
+        "subsequent block queries (e.g. getblock, getblockheader) to detect whether the active chain\n"
+        "has been reorganized between reads: as long as the cursor block remains part of the active\n"
+        "chain the query succeeds, and if the chain has been reorganized so that the cursor is no\n"
+        "longer part of the active chain the query fails with a chain-cursor-mismatch error instead\n"
+        "of silently returning data from a different chain.\n",
+        {},
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM, "height", "The height of the active chain tip"},
+                {RPCResult::Type::STR_HEX, "hash", "The block hash of the active chain tip"},
+                {RPCResult::Type::STR_HEX, "cursor", "Opaque cursor token identifying the active chain tip (currently equal to the tip block hash)"},
+            }},
+        RPCExamples{
+            HelpExampleCli("getchaintipcursor", "")
+            + HelpExampleRpc("getchaintipcursor", "")
+        },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    LOCK(cs_main);
+    const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+    if (!tip) {
+        throw JSONRPCError(RPC_IN_WARMUP, "Chain tip not available yet");
+    }
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("height", tip->nHeight);
+    result.pushKV("hash", tip->GetBlockHash().GetHex());
+    result.pushKV("cursor", ChainCursorJSON(*tip));
+    return result;
+},
     };
 }
 
@@ -3676,6 +3770,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getblockhash},
         {"blockchain", &getblockheader},
         {"blockchain", &getchaintips},
+        {"blockchain", &getchaintipcursor},
         {"blockchain", &getdifficulty},
         {"blockchain", &getdeploymentinfo},
         {"blockchain", &gettxout},
